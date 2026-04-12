@@ -10,10 +10,11 @@ from kosong.chat_provider import ChatProvider
 from pydantic import SecretStr
 
 from kimi_cli.constant import USER_AGENT
+from kimi_cli.utils.logging import logger
 
 if TYPE_CHECKING:
     from kimi_cli.auth.oauth import OAuthManager
-    from kimi_cli.config import LLMModel, LLMProvider
+    from kimi_cli.config import Config, LLMModel, LLMProvider
 
 type ProviderType = Literal[
     "kimi",
@@ -114,6 +115,10 @@ def create_llm(
     if provider.type not in {"_echo", "_scripted_echo"} and (
         not provider.base_url or not model.model
     ):
+        logger.warning(
+            "Cannot create LLM: missing base_url or model (provider_type={provider_type})",
+            provider_type=provider.type,
+        )
         return None
 
     resolved_api_key = (
@@ -152,6 +157,7 @@ def create_llm(
                 model=model.model,
                 base_url=provider.base_url,
                 api_key=resolved_api_key,
+                default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "openai_responses":
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
@@ -160,6 +166,7 @@ def create_llm(
                 model=model.model,
                 base_url=provider.base_url,
                 api_key=resolved_api_key,
+                default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "anthropic":
             from kosong.contrib.chat_provider.anthropic import Anthropic
@@ -170,6 +177,7 @@ def create_llm(
                 api_key=resolved_api_key,
                 default_max_tokens=50000,
                 metadata={"user_id": session_id} if session_id else None,
+                default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "google_genai" | "gemini":
             from kosong.contrib.chat_provider.google_genai import GoogleGenAI
@@ -178,6 +186,7 @@ def create_llm(
                 model=model.model,
                 base_url=provider.base_url,
                 api_key=resolved_api_key,
+                default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "vertexai":
             from kosong.contrib.chat_provider.google_genai import GoogleGenAI
@@ -188,6 +197,7 @@ def create_llm(
                 base_url=provider.base_url,
                 api_key=resolved_api_key,
                 vertexai=True,
+                default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "_echo":
             from kosong.chat_provider.echo import EchoChatProvider
@@ -234,6 +244,34 @@ def create_llm(
         capabilities=capabilities,
         model_config=model,
         provider_config=provider,
+    )
+
+
+def clone_llm_with_model_alias(
+    llm: LLM | None,
+    config: Config,
+    model_alias: str | None,
+    *,
+    session_id: str,
+    oauth: OAuthManager | None,
+) -> LLM | None:
+    if model_alias is None:
+        return llm
+    if model_alias not in config.models:
+        raise KeyError(f"Unknown model alias: {model_alias}")
+    model = config.models[model_alias]
+    provider = config.providers[model.provider]
+    thinking: bool | None = None
+    if llm is not None:
+        effort = getattr(llm.chat_provider, "thinking_effort", None)
+        if effort is not None:
+            thinking = effort != "off"
+    return create_llm(
+        provider,
+        model,
+        thinking=thinking,
+        session_id=session_id,
+        oauth=oauth,
     )
 
 

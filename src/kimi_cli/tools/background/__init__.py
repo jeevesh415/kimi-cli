@@ -5,11 +5,11 @@ from typing import override
 from kosong.tooling import CallableTool2, ToolError, ToolReturnValue
 from pydantic import BaseModel, Field
 
-from kimi_cli.background import TaskStatus, TaskView, format_task, format_task_list, list_task_views
+from kimi_cli.background import TaskView, format_task, format_task_list, list_task_views
 from kimi_cli.soul.agent import Runtime
 from kimi_cli.soul.approval import Approval
 from kimi_cli.tools.display import BackgroundTaskDisplayBlock
-from kimi_cli.tools.utils import ToolRejectedError, load_desc
+from kimi_cli.tools.utils import load_desc
 
 TASK_OUTPUT_PREVIEW_BYTES = 32 << 10
 TASK_OUTPUT_READ_HINT_LINES = 300
@@ -54,6 +54,11 @@ def _format_task_output(
         f"status: {view.runtime.status}",
         f"description: {view.spec.description}",
     ]
+    if view.spec.kind == "agent" and view.spec.kind_payload:
+        if agent_id := view.spec.kind_payload.get("agent_id"):
+            lines.append(f"agent_id: {agent_id}")
+        if subagent_type := view.spec.kind_payload.get("subagent_type"):
+            lines.append(f"subagent_type: {subagent_type}")
     if view.spec.command:
         lines.append(f"command: {view.spec.command}")
     lines.extend(
@@ -106,7 +111,7 @@ def _format_task_output(
 class TaskOutputParams(BaseModel):
     task_id: str = Field(description="The background task ID to inspect.")
     block: bool = Field(
-        default=True,
+        default=False,
         description="Whether to wait for the task to finish before returning.",
     )
     timeout: int = Field(
@@ -183,31 +188,25 @@ class TaskOutput(CallableTool2[TaskOutputParams]):
         super().__init__()
         self._runtime = runtime
 
-    def _render_output_preview(
-        self, task_id: str, *, status: TaskStatus
-    ) -> tuple[str, bool, int, int, bool, Path]:
-        output_path = self._runtime.background_tasks.store.output_path(task_id)
-        output_available = output_path.exists()
+    def _render_output_preview(self, task_id: str) -> tuple[str, bool, int, int, bool, Path]:
+        manager = self._runtime.background_tasks
+        output_path = manager.resolve_output_path(task_id)
         try:
-            output_size = output_path.stat().st_size
+            output_size = output_path.stat().st_size if output_path.exists() else 0
         except OSError:
             output_size = 0
         preview_offset = max(0, output_size - TASK_OUTPUT_PREVIEW_BYTES)
-        chunk = self._runtime.background_tasks.store.read_output(
+        chunk = manager.read_output(
             task_id,
-            preview_offset,
-            TASK_OUTPUT_PREVIEW_BYTES,
-            status=status,
+            offset=preview_offset,
+            max_bytes=TASK_OUTPUT_PREVIEW_BYTES,
         )
-        preview_bytes = chunk.next_offset - chunk.offset
-        preview_text = chunk.text.rstrip("\n")
-        preview_truncated = preview_offset > 0
         return (
-            preview_text,
-            output_available,
+            chunk.text.rstrip("\n"),
+            output_size > 0,
             output_size,
-            preview_bytes,
-            preview_truncated,
+            chunk.next_offset - chunk.offset,
+            preview_offset > 0,
             output_path,
         )
 
@@ -244,10 +243,7 @@ class TaskOutput(CallableTool2[TaskOutputParams]):
             output_preview_bytes,
             output_truncated,
             output_path,
-        ) = self._render_output_preview(
-            params.task_id,
-            status=view.runtime.status,
-        )
+        ) = self._render_output_preview(params.task_id)
         consumer = view.consumer.model_copy(
             update={
                 "last_seen_output_size": output_size,
@@ -268,7 +264,11 @@ class TaskOutput(CallableTool2[TaskOutputParams]):
                 output_preview_bytes=output_preview_bytes,
                 output_truncated=output_truncated,
             ),
-            message="Task output retrieved.",
+            message=(
+                "Task snapshot retrieved."
+                if not params.block and retrieval_status == "not_ready"
+                else "Task output retrieved."
+            ),
             display=[_task_display(self._runtime, params.task_id)],
         )
 
@@ -297,13 +297,14 @@ class TaskStop(CallableTool2[TaskStopParams]):
         if view is None:
             return ToolError(message=f"Task not found: {params.task_id}", brief="Task not found")
 
-        if not await self._approval.request(
+        result = await self._approval.request(
             self.name,
             "stop background task",
             f"Stop background task `{params.task_id}`",
             display=[_task_display(self._runtime, params.task_id)],
-        ):
-            return ToolRejectedError()
+        )
+        if not result:
+            return result.rejection_error()
 
         view = self._runtime.background_tasks.kill(
             params.task_id,

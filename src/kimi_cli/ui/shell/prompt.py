@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import md5
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast, override
+from typing import Any, Literal, Protocol, cast, override, runtime_checkable
 
 from kaos.path import KaosPath
 from prompt_toolkit import PromptSession
@@ -38,16 +39,16 @@ from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.containers import (
     ConditionalContainer,
+    DynamicContainer,
     Float,
     FloatContainer,
     HSplit,
     Window,
 )
-from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.layout.controls import BufferControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from pydantic import BaseModel, ValidationError
 
@@ -61,6 +62,7 @@ from kimi_cli.ui.shell.placeholders import (
     normalize_pasted_text,
     sanitize_surrogates,
 )
+from kimi_cli.ui.theme import get_prompt_style, get_toolbar_colors
 from kimi_cli.utils.clipboard import (
     grab_media_from_clipboard,
     is_clipboard_available,
@@ -77,6 +79,10 @@ PROMPT_SYMBOL = "✨"
 PROMPT_SYMBOL_SHELL = "$"
 PROMPT_SYMBOL_THINKING = "💫"
 PROMPT_SYMBOL_PLAN = "📋"
+
+
+class CwdLostError(OSError):
+    """Raised when the working directory no longer exists (e.g. external drive unplugged)."""
 
 
 class SlashCommandCompleter(Completer):
@@ -270,6 +276,60 @@ def _extract_float_container(container: object) -> FloatContainer | None:
         if isinstance(container.alternative_content, FloatContainer):
             return container.alternative_content
     return None
+
+
+def _find_default_buffer_container(
+    layout_container: object,
+    target_buffer: Buffer,
+) -> ConditionalContainer | None:
+    seen: set[int] = set()
+
+    def _walk(node: object) -> ConditionalContainer | None:
+        if id(node) in seen:
+            return None
+        seen.add(id(node))
+
+        if isinstance(node, ConditionalContainer):
+            content = getattr(node, "content", None)
+            if isinstance(content, Window):
+                control = content.content
+                if isinstance(control, BufferControl) and control.buffer is target_buffer:
+                    return node
+
+        if isinstance(node, DynamicContainer):
+            with contextlib.suppress(Exception):
+                found = _walk(node.get_container())
+                if found is not None:
+                    return found
+
+        for attr in ("children", "content", "floats", "container"):
+            if not hasattr(node, attr):
+                continue
+            value = getattr(node, attr)
+            if attr == "children" and isinstance(value, Sequence):
+                for child in value:  # pyright: ignore[reportUnknownVariableType]
+                    found = _walk(child)  # pyright: ignore[reportUnknownArgumentType]
+                    if found is not None:
+                        return found
+            elif attr == "floats" and isinstance(value, Sequence):
+                for float_ in value:  # pyright: ignore[reportUnknownVariableType]
+                    content = getattr(float_, "content", None)  # pyright: ignore[reportUnknownArgumentType]
+                    if content is None:
+                        continue
+                    found = _walk(content)
+                    if found is not None:
+                        return found
+            elif (
+                attr in {"content", "container"}
+                and value is not None
+                and type(value).__module__.startswith("prompt_toolkit")
+            ):
+                found = _walk(value)
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(layout_container)
 
 
 class SlashCommandMenuControl(UIControl):
@@ -556,82 +616,15 @@ class SlashCommandMenuControl(UIControl):
 
 
 class LocalFileMentionCompleter(Completer):
-    """Offer fuzzy `@` path completion by indexing workspace files."""
+    """Offer fuzzy `@` path completion by indexing workspace files.
+
+    File discovery and ignore rules are delegated to
+    :mod:`kimi_cli.utils.file_filter` so that the web backend can reuse
+    them.
+    """
 
     _FRAGMENT_PATTERN = re.compile(r"[^\s@]+")
     _TRIGGER_GUARDS = frozenset((".", "-", "_", "`", "'", '"', ":", "@", "#", "~"))
-    _IGNORED_NAME_GROUPS: dict[str, tuple[str, ...]] = {
-        "vcs_metadata": (".DS_Store", ".bzr", ".git", ".hg", ".svn"),
-        "tooling_caches": (
-            ".build",
-            ".cache",
-            ".coverage",
-            ".fleet",
-            ".gradle",
-            ".idea",
-            ".ipynb_checkpoints",
-            ".pnpm-store",
-            ".pytest_cache",
-            ".pub-cache",
-            ".ruff_cache",
-            ".swiftpm",
-            ".tox",
-            ".venv",
-            ".vs",
-            ".vscode",
-            ".yarn",
-            ".yarn-cache",
-        ),
-        "js_frontend": (
-            ".next",
-            ".nuxt",
-            ".parcel-cache",
-            ".svelte-kit",
-            ".turbo",
-            ".vercel",
-            "node_modules",
-        ),
-        "python_packaging": (
-            "__pycache__",
-            "build",
-            "coverage",
-            "dist",
-            "htmlcov",
-            "pip-wheel-metadata",
-            "venv",
-        ),
-        "java_jvm": (".mvn", "out", "target"),
-        "dotnet_native": ("bin", "cmake-build-debug", "cmake-build-release", "obj"),
-        "bazel_buck": ("bazel-bin", "bazel-out", "bazel-testlogs", "buck-out"),
-        "misc_artifacts": (
-            ".dart_tool",
-            ".serverless",
-            ".stack-work",
-            ".terraform",
-            ".terragrunt-cache",
-            "DerivedData",
-            "Pods",
-            "deps",
-            "tmp",
-            "vendor",
-        ),
-    }
-    _IGNORED_NAMES = frozenset(name for group in _IGNORED_NAME_GROUPS.values() for name in group)
-    _IGNORED_PATTERN_PARTS: tuple[str, ...] = (
-        r".*_cache$",
-        r".*-cache$",
-        r".*\.egg-info$",
-        r".*\.dist-info$",
-        r".*\.py[co]$",
-        r".*\.class$",
-        r".*\.sw[po]$",
-        r".*~$",
-        r".*\.(?:tmp|bak)$",
-    )
-    _IGNORED_PATTERNS = re.compile(
-        "|".join(f"(?:{part})" for part in _IGNORED_PATTERN_PARTS),
-        re.IGNORECASE,
-    )
 
     def __init__(
         self,
@@ -645,9 +638,12 @@ class LocalFileMentionCompleter(Completer):
         self._limit = limit
         self._cache_time: float = 0.0
         self._cached_paths: list[str] = []
+        self._cache_scope: str | None = None
         self._top_cache_time: float = 0.0
         self._top_cached_paths: list[str] = []
         self._fragment_hint: str | None = None
+        self._is_git: bool | None = None  # lazily detected
+        self._git_index_mtime: float | None = None
 
         self._word_completer = WordCompleter(
             self._get_paths,
@@ -661,14 +657,6 @@ class LocalFileMentionCompleter(Completer):
             pattern=r"^[^\s@]*",
         )
 
-    @classmethod
-    def _is_ignored(cls, name: str) -> bool:
-        if not name:
-            return True
-        if name in cls._IGNORED_NAMES:
-            return True
-        return bool(cls._IGNORED_PATTERNS.fullmatch(name))
-
     def _get_paths(self) -> list[str]:
         fragment = self._fragment_hint or ""
         if "/" not in fragment and len(fragment) < 3:
@@ -676,6 +664,8 @@ class LocalFileMentionCompleter(Completer):
         return self._get_deep_paths()
 
     def _get_top_level_paths(self) -> list[str]:
+        from kimi_cli.utils.file_filter import is_ignored
+
         now = time.monotonic()
         if now - self._top_cache_time <= self._refresh_interval:
             return self._top_cached_paths
@@ -684,7 +674,7 @@ class LocalFileMentionCompleter(Completer):
         try:
             for entry in sorted(self._root.iterdir(), key=lambda p: p.name):
                 name = entry.name
-                if self._is_ignored(name):
+                if is_ignored(name):
                     continue
                 entries.append(f"{name}/" if entry.is_dir() else name)
                 if len(entries) >= self._limit:
@@ -697,45 +687,45 @@ class LocalFileMentionCompleter(Completer):
         return self._top_cached_paths
 
     def _get_deep_paths(self) -> list[str]:
+        from kimi_cli.utils.file_filter import (
+            detect_git,
+            git_index_mtime,
+            list_files_git,
+            list_files_walk,
+        )
+
+        fragment = self._fragment_hint or ""
+
+        scope: str | None = None
+        if "/" in fragment:
+            scope = fragment.rsplit("/", 1)[0]
+
         now = time.monotonic()
-        if now - self._cache_time <= self._refresh_interval:
+        cache_valid = (
+            now - self._cache_time <= self._refresh_interval and self._cache_scope == scope
+        )
+
+        # Invalidate on .git/index mtime change (like Claude Code).
+        if cache_valid and self._is_git:
+            mtime = git_index_mtime(self._root)
+            if mtime != self._git_index_mtime:
+                cache_valid = False
+
+        if cache_valid:
             return self._cached_paths
 
-        paths: list[str] = []
-        try:
-            for current_root, dirs, files in os.walk(self._root):
-                relative_root = Path(current_root).relative_to(self._root)
+        if self._is_git is None:
+            self._is_git = detect_git(self._root)
 
-                # Prevent descending into ignored directories.
-                dirs[:] = sorted(d for d in dirs if not self._is_ignored(d))
-
-                if relative_root.parts and any(
-                    self._is_ignored(part) for part in relative_root.parts
-                ):
-                    dirs[:] = []
-                    continue
-
-                if relative_root.parts:
-                    paths.append(relative_root.as_posix() + "/")
-                    if len(paths) >= self._limit:
-                        break
-
-                for file_name in sorted(files):
-                    if self._is_ignored(file_name):
-                        continue
-                    relative = (relative_root / file_name).as_posix()
-                    if not relative:
-                        continue
-                    paths.append(relative)
-                    if len(paths) >= self._limit:
-                        break
-
-                if len(paths) >= self._limit:
-                    break
-        except OSError:
-            return self._cached_paths
+        paths: list[str] | None = None
+        if self._is_git:
+            paths = list_files_git(self._root, scope)
+            self._git_index_mtime = git_index_mtime(self._root)
+        if paths is None:
+            paths = list_files_walk(self._root, scope, limit=self._limit)
 
         self._cached_paths = paths
+        self._cache_scope = scope
         self._cache_time = now
         return self._cached_paths
 
@@ -856,6 +846,12 @@ class PromptMode(Enum):
 
     def __str__(self) -> str:
         return self.value
+
+
+class PromptUIState(Enum):
+    NORMAL_INPUT = "normal_input"
+    MODAL_HIDDEN_INPUT = "modal_hidden_input"
+    MODAL_TEXT_INPUT = "modal_text_input"
 
 
 class UserInput(BaseModel):
@@ -1079,13 +1075,36 @@ class _ToastEntry:
 
 
 class RunningPromptDelegate(Protocol):
+    """Protocol for components that can take over the bottom prompt area."""
+
+    modal_priority: int
+
     def render_running_prompt_body(self, columns: int) -> AnyFormattedText: ...
 
     def running_prompt_placeholder(self) -> AnyFormattedText | None: ...
 
+    def running_prompt_allows_text_input(self) -> bool: ...
+
+    def running_prompt_hides_input_buffer(self) -> bool: ...
+
+    def running_prompt_accepts_submission(self) -> bool: ...
+
     def should_handle_running_prompt_key(self, key: str) -> bool: ...
 
     def handle_running_prompt_key(self, key: str, event: KeyPressEvent) -> None: ...
+
+
+@runtime_checkable
+class AgentStatusProvider(Protocol):
+    """Optional protocol for delegates that render always-visible agent status.
+
+    When the running prompt delegate implements this, ``_render_agent_status``
+    will call ``render_agent_status`` instead of the fallback status block.
+    This ensures spinners, content blocks, and tool calls remain visible
+    even when a modal (approval/question/btw) is active.
+    """
+
+    def render_agent_status(self, columns: int) -> AnyFormattedText: ...
 
 
 _toast_queues: dict[Literal["left", "right"], deque[_ToastEntry]] = {
@@ -1132,6 +1151,8 @@ def _build_toolbar_tips(clipboard_available: bool) -> list[str]:
         "shift-tab: plan mode",
         "ctrl-o: editor",
         "ctrl-j: newline",
+        "/feedback: send feedback",
+        "/theme: switch dark/light",
     ]
     if clipboard_available:
         tips.append("ctrl-v: paste clipboard")
@@ -1176,13 +1197,20 @@ class CustomPromptSession:
         self._placeholder_manager = PromptPlaceholderManager()
         # Keep the old attribute for test compatibility and for any external imports.
         self._attachment_cache = self._placeholder_manager.attachment_cache
-        self._tip_rotation_index: int = 0
         self._last_tip_rotate_time: float = time.monotonic()
         self._last_submission_was_running = False
+        self._last_input_activity_time: float = 0.0
+        self._suppress_auto_completion: bool = False
+        self._input_activity_event: asyncio.Event = asyncio.Event()
         self._running_prompt_previous_mode: PromptMode | None = None
         self._running_prompt_delegate: RunningPromptDelegate | None = None
+        self._modal_delegates: list[RunningPromptDelegate] = []
+        self._prompt_buffer_container: ConditionalContainer | None = None
+        self._last_ui_state: PromptUIState = PromptUIState.NORMAL_INPUT
+        self._suspended_buffer_document: Document | None = None
         clipboard_available = is_clipboard_available()
         self._tips = _build_toolbar_tips(clipboard_available)
+        self._tip_rotation_index: int = random.randrange(len(self._tips)) if self._tips else 0
 
         history_entries = _load_history_entries(self._history_file)
         history = InMemoryHistory()
@@ -1207,20 +1235,43 @@ class CustomPromptSession:
         # Build key bindings
         _kb = KeyBindings()
 
-        @_kb.add("enter", filter=has_completions)
-        def _(event: KeyPressEvent) -> None:
-            """Accept the first completion when Enter is pressed and completions are shown."""
-            buff = event.current_buffer
-            if buff.complete_state and buff.complete_state.completions:
-                # Get the current completion, or use the first one if none is selected
-                completion = buff.complete_state.current_completion
-                if not completion:
-                    completion = buff.complete_state.completions[0]
+        def _accept_completion(buff: Buffer) -> None:
+            """Accept the current or first completion, suppressing re-completion."""
+            completion = buff.complete_state.current_completion  # type: ignore[union-attr]
+            if not completion:
+                completion = buff.complete_state.completions[0]  # type: ignore[union-attr]
+            self._suppress_auto_completion = True
+            try:
                 buff.apply_completion(completion)
+            finally:
+                self._suppress_auto_completion = False
+
+        def _is_slash_completion() -> bool:
+            """True when the active completion menu is for a slash command."""
+            buff = self._session.default_buffer
+            return bool(
+                buff.complete_state
+                and buff.complete_state.completions
+                and SlashCommandCompleter.should_complete(buff.document)
+            )
+
+        _slash_completion_filter = has_completions & Condition(_is_slash_completion)
+        _non_slash_completion_filter = has_completions & ~Condition(_is_slash_completion)
+
+        @_kb.add("enter", filter=_slash_completion_filter)
+        def _(event: KeyPressEvent) -> None:
+            """Slash command completion: accept and submit in one step."""
+            _accept_completion(event.current_buffer)
+            event.current_buffer.validate_and_handle()
+
+        @_kb.add("enter", filter=_non_slash_completion_filter)
+        def _(event: KeyPressEvent) -> None:
+            """Non-slash completion (file mentions, etc.): accept only."""
+            _accept_completion(event.current_buffer)
 
         @_kb.add("c-x", eager=True)
         def _(event: KeyPressEvent) -> None:
-            if self._running_prompt_delegate is not None:
+            if self._active_prompt_delegate() is not None:
                 return
             self._mode = self._mode.toggle()
             # Apply mode-specific settings
@@ -1231,7 +1282,7 @@ class CustomPromptSession:
         @_kb.add("s-tab", eager=True)
         def _(event: KeyPressEvent) -> None:
             """Toggle plan mode with Shift+Tab."""
-            if self._running_prompt_delegate is not None:
+            if self._active_prompt_delegate() is not None:
                 return
             if self._plan_mode_toggle_callback is not None:
 
@@ -1315,12 +1366,36 @@ class CustomPromptSession:
             self._handle_running_prompt_key("space", event)
 
         @_kb.add(
+            "c-s",
+            eager=True,
+            filter=Condition(lambda: self._should_handle_running_prompt_key("c-s")),
+        )
+        def _(event: KeyPressEvent) -> None:
+            self._handle_running_prompt_key("c-s", event)
+
+        @_kb.add(
             "c-e",
             eager=True,
             filter=Condition(lambda: self._should_handle_running_prompt_key("c-e")),
         )
         def _(event: KeyPressEvent) -> None:
             self._handle_running_prompt_key("c-e", event)
+
+        @_kb.add(
+            "c-c",
+            eager=True,
+            filter=Condition(lambda: self._should_handle_running_prompt_key("c-c")),
+        )
+        def _(event: KeyPressEvent) -> None:
+            self._handle_running_prompt_key("c-c", event)
+
+        @_kb.add(
+            "c-d",
+            eager=True,
+            filter=Condition(lambda: self._should_handle_running_prompt_key("c-d")),
+        )
+        def _(event: KeyPressEvent) -> None:
+            self._handle_running_prompt_key("c-d", event)
 
         @_kb.add(
             "escape",
@@ -1403,35 +1478,30 @@ class CustomPromptSession:
             # prompt_continuation=FormattedText([("fg:#4d4d4d", "... ")]),
             completer=self._agent_mode_completer,
             complete_while_typing=True,
-            reserve_space_for_menu=10,
+            reserve_space_for_menu=6,
             key_bindings=_kb,
             clipboard=clipboard,
             history=history,
             bottom_toolbar=self._render_bottom_toolbar,
-            style=Style.from_dict(
-                {
-                    "bottom-toolbar": "noreverse",
-                    "running-prompt-placeholder": "fg:#7c8594 italic",
-                    "running-prompt-separator": "fg:#4a5568",
-                    "slash-completion-menu": "",
-                    "slash-completion-menu.separator": "fg:#4a5568",
-                    "slash-completion-menu.marker": "fg:#4a5568",
-                    "slash-completion-menu.marker.current": "fg:#4f9fff",
-                    "slash-completion-menu.command": "fg:#a6adba",
-                    "slash-completion-menu.meta": "fg:#7c8594",
-                    "slash-completion-menu.command.current": "fg:#6fb7ff bold",
-                    "slash-completion-menu.meta.current": "fg:#56a4ff",
-                }
-            ),
+            style=get_prompt_style(),
+        )
+        self._session.default_buffer.read_only = Condition(
+            lambda: (
+                (delegate := self._active_prompt_delegate()) is not None
+                and not delegate.running_prompt_allows_text_input()
+            )
         )
         self._install_slash_completion_menu()
+        self._install_prompt_buffer_visibility()
         self._apply_mode()
 
         # Allow completion to be triggered when the text is changed,
         # such as when backspace is used to delete text.
         @self._session.default_buffer.on_text_changed.add_handler
         def _(buffer: Buffer) -> None:
-            if buffer.complete_while_typing():
+            self._last_input_activity_time = time.monotonic()
+            self._input_activity_event.set()
+            if buffer.complete_while_typing() and not self._suppress_auto_completion:
                 buffer.start_completion()
 
         self._status_refresh_task: asyncio.Task[None] | None = None
@@ -1482,6 +1552,18 @@ class CustomPromptSession:
             filter=~Condition(self._should_show_slash_completion_menu),
         )
 
+    def _install_prompt_buffer_visibility(self) -> None:
+        buffer_container = _find_default_buffer_container(
+            self._session.layout.container,
+            self._session.default_buffer,
+        )
+        if buffer_container is None:
+            return
+        buffer_container.filter = buffer_container.filter & Condition(
+            self._should_render_input_buffer
+        )
+        self._prompt_buffer_container = buffer_container
+
     def _should_show_slash_completion_menu(self) -> bool:
         document = self._session.default_buffer.document
         return SlashCommandCompleter.should_complete(document)
@@ -1489,10 +1571,8 @@ class CustomPromptSession:
     def _slash_menu_left_padding(self) -> int:
         if self._mode == PromptMode.SHELL:
             return max(1, get_cwidth(f"{PROMPT_SYMBOL_SHELL} ") - 2)
-        if self._status_provider().plan_mode:
-            return max(1, get_cwidth(f"{PROMPT_SYMBOL_PLAN} ") - 2)
-        symbol = PROMPT_SYMBOL_THINKING if self._thinking else PROMPT_SYMBOL
-        return max(1, get_cwidth(f"{symbol} ") - 2)
+        # Agent mode: prompt prefix is "│  " (3 chars inside input panel)
+        return 1
 
     def _render_message(self) -> FormattedText:
         if self._mode == PromptMode.SHELL:
@@ -1503,14 +1583,29 @@ class CustomPromptSession:
         app = get_app_or_none()
         columns = app.output.get_size().columns if app is not None else 80
         fragments: FormattedText = FormattedText()
-        body = self._render_status_block(columns)
+
+        # Agent status (always visible)
+        agent_status = self._render_agent_status(columns)
+        if agent_status:
+            fragments.extend(agent_status)
+            if not agent_status[-1][1].endswith("\n"):
+                fragments.append(("", "\n"))
+
+        # Interactive body
+        body = self._render_interactive_body(columns)
         if body:
             fragments.extend(body)
             if not body[-1][1].endswith("\n"):
                 fragments.append(("", "\n"))
+
+        if self._active_modal_delegate() is not None:
+            return fragments
+        has_content = bool(agent_status or body)
+        if has_content:
             fragments.append(("", "\n"))
-            fragments.append(("class:running-prompt-separator", "─" * max(0, columns)))
-            fragments.append(("", "\n"))
+        # Shell mode: simple separator + $ prefix (no panel border)
+        fragments.append(("class:running-prompt-separator", "─" * max(0, columns)))
+        fragments.append(("", "\n"))
         fragments.append(("bold", f"{PROMPT_SYMBOL_SHELL} "))
         return fragments
 
@@ -1562,42 +1657,146 @@ class CustomPromptSession:
         if app is not None:
             app.erase_when_done = self._mode == PromptMode.AGENT
 
+    def _active_modal_delegate(self) -> RunningPromptDelegate | None:
+        modal_delegates = getattr(self, "_modal_delegates", [])
+        if not modal_delegates:
+            return None
+        _, delegate = max(
+            enumerate(modal_delegates),
+            key=lambda item: (item[1].modal_priority, item[0]),
+        )
+        return delegate
+
+    def _active_prompt_delegate(self) -> RunningPromptDelegate | None:
+        if delegate := self._active_modal_delegate():
+            return delegate
+        return getattr(self, "_running_prompt_delegate", None)
+
+    def _active_ui_state(self) -> PromptUIState:
+        delegate = self._active_modal_delegate()
+        if delegate is None:
+            return PromptUIState.NORMAL_INPUT
+        if delegate.running_prompt_hides_input_buffer():
+            return PromptUIState.MODAL_HIDDEN_INPUT
+        if delegate.running_prompt_allows_text_input():
+            return PromptUIState.MODAL_TEXT_INPUT
+        return PromptUIState.NORMAL_INPUT
+
+    def _should_render_input_buffer(self) -> bool:
+        return self._active_ui_state() != PromptUIState.MODAL_HIDDEN_INPUT
+
     def _should_handle_running_prompt_key(self, key: str) -> bool:
-        running_prompt = getattr(self, "_running_prompt_delegate", None)
-        return running_prompt is not None and running_prompt.should_handle_running_prompt_key(key)
+        delegate = self._active_prompt_delegate()
+        return delegate is not None and delegate.should_handle_running_prompt_key(key)
 
     def _handle_running_prompt_key(self, key: str, event: KeyPressEvent) -> None:
-        running_prompt = self._running_prompt_delegate
-        if running_prompt is None:
+        delegate = self._active_prompt_delegate()
+        if delegate is None:
             return
-        running_prompt.handle_running_prompt_key(key, event)
+        delegate.handle_running_prompt_key(key, event)
         event.app.invalidate()
 
     def invalidate(self) -> None:
+        self._sync_prompt_ui_state()
         app = get_app_or_none()
         if app is not None:
             app.invalidate()
+
+    def _sync_prompt_ui_state(self) -> None:
+        new_state = self._active_ui_state()
+        old_state = getattr(self, "_last_ui_state", PromptUIState.NORMAL_INPUT)
+        buffer = self._session.default_buffer
+
+        if (
+            old_state != PromptUIState.MODAL_HIDDEN_INPUT
+            and new_state == PromptUIState.MODAL_HIDDEN_INPUT
+        ):
+            if self._suspended_buffer_document is None and buffer.text:
+                self._suspended_buffer_document = buffer.document
+                buffer.set_document(Document(), bypass_readonly=True)
+        elif (
+            old_state == PromptUIState.MODAL_HIDDEN_INPUT
+            and new_state != PromptUIState.MODAL_HIDDEN_INPUT
+            and self._suspended_buffer_document is not None
+        ):
+            if not buffer.text:
+                buffer.set_document(self._suspended_buffer_document, bypass_readonly=True)
+            else:
+                # Buffer was externally modified (e.g. approval inline feedback).
+                # Don't overwrite the new content, but log that the old input is lost.
+                logger.debug(
+                    "Dropping suspended buffer document because buffer was modified externally"
+                )
+            self._suspended_buffer_document = None
+
+        self._last_ui_state = new_state
 
     def _render_agent_prompt_message(self) -> FormattedText:
         app = get_app_or_none()
         columns = app.output.get_size().columns if app is not None else 80
         fragments: FormattedText = FormattedText()
-        body = self._render_agent_prompt_body(columns)
+
+        # 1. Agent status — ALWAYS rendered from running prompt delegate.
+        #    This ensures spinners, content blocks, tool calls etc. stay
+        #    visible even when a modal (btw/approval/question) is active.
+        agent_status = self._render_agent_status(columns)
+        if agent_status:
+            fragments.extend(agent_status)
+            if not agent_status[-1][1].endswith("\n"):
+                fragments.append(("", "\n"))
+
+        # 2. Interactive area — from the active delegate (modal overrides).
+        body = self._render_interactive_body(columns)
         if body:
             fragments.extend(body)
             if not body[-1][1].endswith("\n"):
                 fragments.append(("", "\n"))
+
+        # 3. When a modal is active, skip input panel border.
+        if self._active_modal_delegate() is not None:
+            return fragments
+
+        # 4. Input section header — style varies by mode:
+        #    normal:  ── input ─────────────────  (grey, solid)
+        #    plan:    ╌╌ input · plan ╌╌╌╌╌╌╌╌╌  (blue, dashed)
+        status = self._status_provider()
+        # Build title parts
+        title_parts = ["input"]
+        if status.plan_mode:
+            title_parts.append("plan")
+        # Queue count from running prompt delegate
+        running = self._running_prompt_delegate
+        queue_count = len(getattr(running, "_queued_messages", []))
+        if queue_count > 0:
+            title_parts.append(f"{queue_count} queued")
+        title = f" {' · '.join(title_parts)} "
+        if status.plan_mode:
+            dash = "╌"
+            style = "fg:#60a5fa"  # blue
+        else:
+            dash = "─"
+            style = "class:running-prompt-separator"
+        border_fill = max(0, columns - len(title) - 2)
+        top_border = f"{dash}{dash}{title}{dash * border_fill}"
         fragments.append(("", "\n"))
-        fragments.append(("class:running-prompt-separator", "─" * max(0, columns)))
+        fragments.append((style, top_border))
         fragments.append(("", "\n"))
-        fragments.extend(self._render_agent_prompt_label())
+        fragments.append(("", " "))
         return fragments
 
-    def _render_agent_prompt_body(self, columns: int) -> FormattedText:
-        running_prompt = self._running_prompt_delegate
-        if running_prompt is None:
-            return self._render_status_block(columns)
-        return to_formatted_text(running_prompt.render_running_prompt_body(columns))
+    def _render_agent_status(self, columns: int) -> FormattedText:
+        """Render agent streaming output (always visible, independent of modals)."""
+        running = self._running_prompt_delegate
+        if running is not None and isinstance(running, AgentStatusProvider):
+            return to_formatted_text(running.render_agent_status(columns))
+        return self._render_status_block(columns)
+
+    def _render_interactive_body(self, columns: int) -> FormattedText:
+        """Render the interactive area from the active delegate (modal or running prompt)."""
+        delegate = self._active_prompt_delegate()
+        if delegate is None:
+            return FormattedText([])
+        return to_formatted_text(delegate.render_running_prompt_body(columns))
 
     def _render_status_block(self, columns: int) -> FormattedText:
         status_block_provider = getattr(self, "_status_block_provider", None)
@@ -1609,11 +1808,8 @@ class CustomPromptSession:
         return to_formatted_text(block)
 
     def _render_agent_prompt_label(self) -> FormattedText:
-        status = self._status_provider()
-        if status.plan_mode:
-            return FormattedText([("fg:#00aaff", f"{PROMPT_SYMBOL_PLAN} ")])
-        symbol = PROMPT_SYMBOL_THINKING if self._thinking else PROMPT_SYMBOL
-        return FormattedText([("", f"{symbol} ")])
+        """Render the prompt label (empty — cursor starts at column 0)."""
+        return FormattedText([("", "  ")])
 
     def __enter__(self) -> CustomPromptSession:
         if self._status_refresh_task is not None and not self._status_refresh_task.done():
@@ -1635,7 +1831,7 @@ class CustomPromptSession:
 
                     interval = (
                         _RUNNING_REFRESH_INTERVAL
-                        if self._running_prompt_delegate is not None
+                        if self._active_prompt_delegate() is not None
                         or (
                             self._fast_refresh_provider is not None
                             and self._fast_refresh_provider()
@@ -1722,12 +1918,39 @@ class CustomPromptSession:
         event.app.invalidate()
         return bool(parts)
 
+    def set_prefill_text(self, text: str) -> None:
+        """Pre-fill the input buffer with the given text.
+
+        Must be called after the prompt session is created but before the
+        first prompt_async call.  The text will appear as editable default
+        input in the next prompt.
+        """
+        self._prefill_text = text
+
     async def prompt_next(self) -> UserInput:
         return await self._prompt_once(append_history=None)
 
     @property
     def last_submission_was_running(self) -> bool:
         return getattr(self, "_last_submission_was_running", False)
+
+    def has_pending_input(self) -> bool:
+        return bool(self._session.default_buffer.text)
+
+    def had_recent_input_activity(self, *, within_s: float) -> bool:
+        if self._last_input_activity_time <= 0:
+            return False
+        return (time.monotonic() - self._last_input_activity_time) <= within_s
+
+    def recent_input_activity_remaining(self, *, within_s: float) -> float:
+        if self._last_input_activity_time <= 0:
+            return 0.0
+        elapsed = time.monotonic() - self._last_input_activity_time
+        return max(0.0, within_s - elapsed)
+
+    async def wait_for_input_activity(self) -> None:
+        await self._input_activity_event.wait()
+        self._input_activity_event.clear()
 
     def attach_running_prompt(self, delegate: RunningPromptDelegate) -> None:
         current = getattr(self, "_running_prompt_delegate", None)
@@ -1751,16 +1974,46 @@ class CustomPromptSession:
         self._apply_mode()
         self.invalidate()
 
+    def attach_modal(self, delegate: RunningPromptDelegate) -> None:
+        modal_delegates: list[RunningPromptDelegate] | None = getattr(
+            self, "_modal_delegates", None
+        )
+        if modal_delegates is None:
+            modal_delegates = []
+            self._modal_delegates = modal_delegates
+        if delegate in modal_delegates:
+            return
+        modal_delegates.append(delegate)
+        self.invalidate()
+
+    def detach_modal(self, delegate: RunningPromptDelegate) -> None:
+        modal_delegates = getattr(self, "_modal_delegates", None)
+        if not modal_delegates or delegate not in modal_delegates:
+            return
+        modal_delegates.remove(delegate)
+        self.invalidate()
+
+    def running_prompt_accepts_submission(self) -> bool:
+        delegate = self._active_prompt_delegate()
+        if delegate is None:
+            return False
+        return delegate.running_prompt_accepts_submission()
+
     async def _prompt_once(self, *, append_history: bool | None) -> UserInput:
         placeholder = None
-        if self._running_prompt_delegate is not None:
-            placeholder = self._running_prompt_delegate.running_prompt_placeholder()
+        if (delegate := self._active_prompt_delegate()) is not None:
+            placeholder = delegate.running_prompt_placeholder()
+        # Consume one-shot prefill text if set
+        default = getattr(self, "_prefill_text", None) or ""
+        self._prefill_text = None
         with patch_stdout(raw=True):
-            command = str(await self._session.prompt_async(placeholder=placeholder)).strip()
+            command = str(
+                await self._session.prompt_async(placeholder=placeholder, default=default)
+            ).strip()
             command = command.replace("\x00", "")  # just in case null bytes are somehow inserted
             # Sanitize UTF-16 surrogates that may come from Windows clipboard
             command = sanitize_surrogates(command)
-        was_running = self._running_prompt_delegate is not None
+        was_running = self.running_prompt_accepts_submission()
         self._last_submission_was_running = was_running
         if append_history is None:
             append_history = not was_running
@@ -1802,13 +2055,20 @@ class CustomPromptSession:
             )
 
     def _render_bottom_toolbar(self) -> FormattedText:
+        if (
+            hasattr(self, "_session")
+            and self._should_show_slash_completion_menu()
+            and self._session.default_buffer.complete_state is not None
+        ):
+            return FormattedText([])
         app = get_app_or_none()
         assert app is not None
         columns = app.output.get_size().columns
 
         fragments: list[tuple[str, str]] = []
+        tc = get_toolbar_colors()
 
-        fragments.append(("fg:#4d4d4d", "─" * columns))
+        fragments.append((tc.separator, "─" * columns))
         fragments.append(("", "\n"))
 
         remaining = columns
@@ -1822,10 +2082,10 @@ class CustomPromptSession:
         # Status flags: yolo / plan
         status = self._status_provider()
         if status.yolo_enabled:
-            fragments.extend([("bold fg:#ffff00", "yolo"), ("", "  ")])
+            fragments.extend([(tc.yolo_label, "yolo"), ("", "  ")])
             remaining -= 6  # "yolo" = 4, "  " = 2
         if status.plan_mode:
-            fragments.extend([("bold fg:#00aaff", "plan"), ("", "  ")])
+            fragments.extend([(tc.plan_label, "plan"), ("", "  ")])
             remaining -= 6
 
         # Mode indicator (agent / shell) + model name + thinking indicator.
@@ -1846,7 +2106,15 @@ class CustomPromptSession:
 
         # CWD (truncated from left) + git branch with status badge
         # Degrade gracefully on narrow terminals: full → cwd-only → truncated cwd → skip
-        cwd = _truncate_left(_shorten_cwd(str(KaosPath.cwd())), _MAX_CWD_COLS)
+        try:
+            cwd = _truncate_left(_shorten_cwd(str(KaosPath.cwd())), _MAX_CWD_COLS)
+        except OSError:
+            # CWD no longer exists (e.g. external drive unplugged).  Ask
+            # prompt_toolkit to exit; the raised exception will propagate out
+            # of prompt_async() into the Shell's event router which prints a
+            # crash report with session info and exits cleanly.
+            app.exit(exception=CwdLostError())
+            return FormattedText([])
         branch = _get_git_branch()
         if branch:
             dirty, ahead, behind = _get_git_status()
@@ -1863,7 +2131,7 @@ class CustomPromptSession:
             cwd_text = _truncate_right(cwd, max(0, remaining - 2))
             cwd_w = _display_width(cwd_text)
         if cwd_text and remaining >= cwd_w + 2:
-            fragments.extend([("fg:#666666", cwd_text), ("", "  ")])
+            fragments.extend([(tc.cwd, cwd_text), ("", "  ")])
             remaining -= cwd_w + 2
 
         # Active background bash task count
@@ -1874,7 +2142,7 @@ class CustomPromptSession:
             bg_text = f"⚙ bash: {bg_count}"
             bg_width = _display_width(bg_text)
             if remaining >= bg_width + 2:
-                fragments.extend([("fg:#888888", bg_text), ("", "  ")])
+                fragments.extend([(tc.bg_tasks, bg_text), ("", "  ")])
                 remaining -= bg_width + 2
 
         # Tips fill remaining space on line 1
@@ -1882,7 +2150,7 @@ class CustomPromptSession:
         if tip_text and _display_width(tip_text) > remaining:
             tip_text = self._get_one_rotating_tip()
         if tip_text and _display_width(tip_text) <= remaining:
-            fragments.append(("fg:#555555", tip_text))
+            fragments.append((tc.tip, tip_text))
 
         # ── line 2: toast (left) + context (right) — always rendered ──────
         fragments.append(("", "\n"))

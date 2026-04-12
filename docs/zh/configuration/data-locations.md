@@ -99,14 +99,27 @@ Wire 消息记录文件，以 JSONL 格式存储会话中的 Wire 事件。用�
 
 会话状态文件，存储会话的运行状态，包括：
 
+- `title`：用户手动设置的会话标题
 - `approval`：审批决策状态（YOLO 模式开关、已自动批准的操作类型）
 - `plan_mode`：Plan 模式的开关状态
 - `plan_session_id`：当前 Plan 会话的唯一标识符，用于关联 plan 文件
 - `plan_slug`：Plan 文件的路径标识（即 `~/.kimi/plans/<slug>.md` 中的 slug），会话重启后可恢复到同一文件
-- `dynamic_subagents`：动态创建的子 Agent 定义
+- `subagent_instances`：子 Agent 实例的状态和元数据
 - `additional_dirs`：通过 `--add-dir` 或 `/add-dir` 添加的额外工作区目录
 
 恢复会话时，Kimi Code CLI 会读取此文件还原会话状态。此文件使用原子写入，防止崩溃时数据损坏。
+
+### `subagents/<agent_id>/`
+
+每个通过 `Agent` 工具创建的子 Agent 实例在会话目录下有独立的存储目录，包含：
+
+- `context.jsonl`：子 Agent 的对话历史
+- `wire.jsonl`：子 Agent 的 Wire 事件记录
+- `meta.json`：实例元数据（状态、类型、创建时间等）
+- `prompt.txt`：最后执行的 prompt
+- `output`：执行输出
+
+恢复会话时，子 Agent 实例的上下文和状态会自动还原，允许通过 `resume` 参数继续使用。
 
 ## Plan 方案文件
 

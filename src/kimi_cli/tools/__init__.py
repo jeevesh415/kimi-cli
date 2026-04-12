@@ -20,21 +20,17 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
     else:
         json_str = json_content
     try:
-        curr_args: JsonType = json.loads(json_str)
+        curr_args: JsonType = json.loads(json_str, strict=False)
     except json.JSONDecodeError:
         return None
     if not curr_args:
         return None
     key_argument: str = ""
     match tool_name:
-        case "Task":
+        case "Agent":
             if not isinstance(curr_args, dict) or not curr_args.get("description"):
                 return None
             key_argument = str(curr_args["description"])
-        case "CreateSubagent":
-            if not isinstance(curr_args, dict) or not curr_args.get("name"):
-                return None
-            key_argument = str(curr_args["name"])
         case "SendDMail":
             return None
         case "Think":

@@ -11,9 +11,10 @@ Kimi Code CLI shell mode supports the following keyboard shortcuts.
 | `Ctrl-O` | Edit in external editor (`$VISUAL`/`$EDITOR`) |
 | `Ctrl-J` | Insert newline |
 | `Alt-Enter` | Insert newline (same as `Ctrl-J`) |
+| `Ctrl-S` | Steer: inject input immediately into the running turn (during streaming) |
 | `Ctrl-V` | Paste (supports images and video files) |
 | `Ctrl-E` | Expand full approval request content |
-| `1`–`3` | Quick select approval option |
+| `1`–`4` | Quick select approval option (`4` for decline with feedback) |
 | `1`–`5` | Select question option by number |
 | `Ctrl-D` | Exit Kimi Code CLI |
 | `Ctrl-C` | Interrupt current operation |
@@ -82,6 +83,18 @@ Paste clipboard content into the input box. Supports:
 Image pasting requires the model to support `image_in` capability. Video pasting requires the model to support `video_in` capability.
 :::
 
+## Streaming input
+
+### `Ctrl-S`: Steer
+
+During streaming, press `Ctrl-S` to submit the current input (or pop the oldest queued message) and inject it immediately into the running turn's context. The model sees your message right away without waiting for the current turn to end.
+
+If the input box is empty and there are queued messages, `Ctrl-S` pops the oldest queued message and steers it instead.
+
+### `Enter`: Queue
+
+During streaming, pressing `Enter` queues your message for delivery after the current turn completes. The queued message count is shown in the input header (e.g., `── input · 2 queued ──`). Press `↑` on an empty input to recall the last queued message for editing.
+
 ## Approval request operations
 
 ### `Ctrl-E`: Expand full content
@@ -92,7 +105,7 @@ Useful for viewing longer shell commands or file diff content.
 
 ### Number key quick selection
 
-In the approval panel, press `1`–`3` to directly select and submit the corresponding approval option without navigating with arrow keys first.
+In the approval panel, press `1`–`3` to directly select and submit the corresponding approval option without navigating with arrow keys first. Press `4` to enter feedback mode, where you can type a reason for declining and press Enter to submit; the feedback text is passed to the agent to guide its next attempt.
 
 ## Structured question operations
 

@@ -33,11 +33,14 @@ In plan mode, the AI can only use read-only tools (`Glob`, `Grep`, `ReadFile`) t
 
 ### Entering plan mode
 
-There are three ways to enter plan mode:
+There are four ways to enter plan mode:
 
+- **CLI flag**: Use `kimi --plan` to start a new session directly in plan mode
 - **Keyboard shortcut**: Press `Shift-Tab` to toggle plan mode
 - **Slash command**: Enter `/plan` or `/plan on`
 - **AI-initiated**: When facing complex tasks, the AI may request to enter plan mode via the `EnterPlanMode` tool — you can accept or decline
+
+You can also set `default_plan_mode = true` in the config file to start every new session in plan mode by default. See [Configuration files](../configuration/config-files.md).
 
 When plan mode is active, the prompt changes to `📋` and a blue `plan` badge appears in the status bar.
 
@@ -47,6 +50,7 @@ When the AI finishes its plan, it submits it for approval via `ExitPlanMode`. Th
 
 - **Approve / select an approach**: If the plan contains multiple alternative implementation paths, the AI lists 2–3 labeled options (e.g. "Option A", "Option B (Recommended)") for you to choose from — selecting one exits plan mode and tells the AI which path to follow. If the plan has a single path, an **Approve** button is shown instead.
 - **Reject**: Decline the plan, stay in plan mode, and provide feedback via conversation
+- **Reject and Exit**: Decline the plan and exit plan mode in one step
 - **Revise**: Enter revision notes — the AI will update the plan and resubmit
 
 Press `Ctrl-E` to view the full plan content in a fullscreen pager.
@@ -81,8 +85,6 @@ While the AI is executing a task, you can type and send follow-up messages in th
 
 Steer messages are appended to the context after the current step completes, and the AI will see and respond to your message before the next step begins. Approval requests and question panels are also handled inline with keyboard navigation during agent execution.
 
-Any text you type in the input box during a turn but haven't yet submitted is preserved when the turn ends — it won't be lost. You can press `Enter` to send it as the next message, or continue editing.
-
 ::: tip
 Steer messages do not interrupt the AI's currently executing step — they are processed between steps. To interrupt immediately, use `Ctrl-C`.
 :::
@@ -95,9 +97,9 @@ How background tasks work:
 
 1. The AI uses the `Shell` tool with `run_in_background=true` to launch the command
 2. The tool immediately returns a task ID, and the AI continues with other work
-3. When the task completes, the system automatically notifies the AI, which will inform you of the results
+3. When the task completes, if the AI is idle (waiting for user input), the system automatically triggers a new agent turn to process the results — no manual input needed
 
-You can use the `/task` slash command to open the interactive task browser, where you can view the status and output of all background tasks in real time. See [Slash commands reference](../reference/slash-commands.md#task) for details.
+You can use the `/task` slash command to open the interactive task browser, where you can view the status and output of all background tasks in real time (including tasks that are still running). See [Slash commands reference](../reference/slash-commands.md#task) for details.
 
 ::: tip
 By default, up to 4 background tasks can run simultaneously. This can be adjusted in the `[background]` section of the config file. All background tasks are terminated when the CLI exits by default. See [Configuration files](../configuration/config-files.md#background).
@@ -162,6 +164,7 @@ The confirmation prompt will show operation details, including shell command and
 - **Allow**: Execute this operation
 - **Allow for this session**: Automatically approve similar operations in the current session (this decision is persisted with the session and automatically restored when resuming)
 - **Reject**: Do not execute this operation
+- **Reject with feedback**: Decline the operation and provide written feedback telling the agent how to adjust
 
 If you trust the AI's operations, or you're running Kimi Code CLI in a safe isolated environment, you can enable "YOLO mode" to automatically approve all requests:
 

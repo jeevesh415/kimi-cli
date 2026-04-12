@@ -8,9 +8,18 @@
 
 例如，你可以创建一个「代码风格」Skill，告诉 AI 你项目的命名规范、注释风格等；或者创建一个「安全审计」Skill，让 AI 在审查代码时关注特定的安全问题。
 
+**Skills 与插件的区别**
+
+Kimi Code CLI 支持两种扩展机制：
+
+- **Skills**：通过 `SKILL.md` 提供知识性指导，AI 读取后遵循其中的规范。适合定义代码风格、工作流程、最佳实践等。
+- **插件**：通过 `plugin.json` 声明可执行工具，AI 可以直接调用工具获取结果。适合封装脚本、API 调用、数据库查询等。
+
+如需了解插件的详细信息，请参阅 [插件](./plugins.md) 文档。
+
 ## Skill 发现
 
-Kimi Code CLI 采用分层加载机制发现 Skills，按以下优先级加载（后加载的会覆盖同名 Skill）：
+Kimi Code CLI 采用分层加载机制发现 Skills，按以下优先级加载（先加载的同名 Skill 优先）：
 
 **内置 Skills**
 
@@ -18,31 +27,46 @@ Kimi Code CLI 采用分层加载机制发现 Skills，按以下优先级加载�
 
 **用户级 Skills**
 
-存放在用户主目录中，在所有项目中生效。Kimi Code CLI 会按优先级检查以下目录，使用第一个存在的目录：
+存放在用户主目录中，在所有项目中生效。候选目录分为两组，每组内按优先级选取第一个存在的目录，两组的结果独立合并（品牌组特异性更高，优先级更高）：
 
-1. `~/.config/agents/skills/`（推荐）
-2. `~/.agents/skills/`
-3. `~/.kimi/skills/`
-4. `~/.claude/skills/`
-5. `~/.codex/skills/`
+- **品牌组**（互斥选一）：
+  1. `~/.kimi/skills/`
+  2. `~/.claude/skills/`
+  3. `~/.codex/skills/`
+- **通用组**（互斥选一）：
+  1. `~/.config/agents/skills/`（推荐）
+  2. `~/.agents/skills/`
+
+两组分别选出目录后合并加载。当同名 Skill 同时存在于品牌组和通用组时，品牌组的版本优先。
+
+如果你希望同时加载所有品牌目录中的 Skills（而非互斥选一），可以在配置文件中启用 `merge_all_available_skills`：
+
+```toml
+merge_all_available_skills = true
+```
+
+启用后，品牌组中所有存在的目录都会被加载并合并，同名 Skill 按 kimi > claude > codex 的优先级解析。通用组不受影响。
 
 **项目级 Skills**
 
-存放在项目目录中，仅在该项目工作目录下生效。Kimi Code CLI 会按优先级检查以下目录，使用第一个存在的目录：
+存放在项目目录中，仅在该项目工作目录下生效。同样分为两组独立查找：
 
-1. `.agents/skills/`（推荐）
-2. `.kimi/skills/`
-3. `.claude/skills/`
-4. `.codex/skills/`
+- **品牌组**（互斥选一）：
+  1. `.kimi/skills/`
+  2. `.claude/skills/`
+  3. `.codex/skills/`
+- **通用组**：`.agents/skills/`
 
-你也可以通过 `--skills-dir` 参数指定其他目录，此时会跳过用户级和项目级 Skills 的发现：
+`merge_all_available_skills` 配置对项目层同样生效。
+
+你也可以通过 `--skills-dir` 参数指定额外的 Skills 目录。该参数可重复指定，指定后将替代自动发现的用户级和项目级目录：
 
 ```sh
-kimi --skills-dir /path/to/my-skills
+kimi --skills-dir /path/to/my-skills --skills-dir /path/to/more-skills
 ```
 
 ::: tip 提示
-Skills 路径独立于 [`KIMI_SHARE_DIR`](../configuration/env-vars.md#kimi-share-dir)。`KIMI_SHARE_DIR` 用于自定义配置、会话、日志等运行时数据的存储位置，不影响 Skills 的搜索路径。Skills 是跨工具共享的能力扩展（支持 Kimi CLI、Claude、Codex 等多个工具共用），与应用运行时数据是不同类型的数据。如需覆盖 Skills 路径，请使用 `--skills-dir` 参数。
+Skills 路径独立于 [`KIMI_SHARE_DIR`](../configuration/env-vars.md#kimi-share-dir)。`KIMI_SHARE_DIR` 用于自定义配置、会话、日志等运行时数据的存储位置，不影响 Skills 的搜索路径。Skills 是跨工具共享的能力扩展（支持 Kimi CLI、Claude、Codex 等多个工具共用），与应用运行时数据是不同类型的数据。如需自定义 Skills 路径，请使用 `--skills-dir` 参数。
 :::
 
 ## 内置 Skills
