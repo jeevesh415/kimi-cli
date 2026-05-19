@@ -178,16 +178,20 @@ def test_live_view_renders_steer_input_as_user_echo(monkeypatch) -> None:
     printed: list[str] = []
 
     monkeypatch.setattr(view, "cleanup", lambda *, is_interrupt: cleaned.append(is_interrupt))
+
+    def _capture_print(*args, **_kwargs):
+        printed.append(getattr(args[0], "plain", str(args[0])) if args else "")
+
     monkeypatch.setattr(
         shell_visualize.console,
         "print",
-        lambda text: printed.append(getattr(text, "plain", str(text))),
+        _capture_print,
     )
 
     view.dispatch_wire_message(SteerInput(user_input=[TextPart(text="A steer follow-up")]))
 
     assert cleaned == [False]
-    assert printed == ["✨ A steer follow-up"]
+    assert printed == ["✨ A steer follow-up", ""]
 
 
 def test_live_view_flushes_current_output_before_printing_steer_input(monkeypatch) -> None:
@@ -196,16 +200,54 @@ def test_live_view_flushes_current_output_before_printing_steer_input(monkeypatc
 
     monkeypatch.setattr(view, "flush_content", lambda: order.append("flush_content"))
     monkeypatch.setattr(view, "flush_finished_tool_calls", lambda: order.append("flush_tools"))
+
+    def _capture_print(*args, **_kwargs):
+        order.append(("print", getattr(args[0], "plain", str(args[0])) if args else ""))
+
     monkeypatch.setattr(
         shell_visualize.console,
         "print",
-        lambda text: order.append(("print", getattr(text, "plain", str(text)))),
+        _capture_print,
     )
 
     view.dispatch_wire_message(SteerInput(user_input=[TextPart(text="A steer follow-up")]))
 
     assert order[:2] == ["flush_content", "flush_tools"]
-    assert order[-1] == ("print", "✨ A steer follow-up")
+    assert order[-2] == ("print", "✨ A steer follow-up")
+    assert order[-1] == ("print", "")
+
+
+def test_prompt_live_view_handle_immediate_steer_prints_blank_line(monkeypatch) -> None:
+    class _PromptSession:
+        def invalidate(self) -> None:
+            pass
+
+    view = _PromptLiveView(
+        StatusUpdate(),
+        prompt_session=cast(Any, _PromptSession()),
+        steer=lambda _content: None,
+    )
+    printed: list[str] = []
+
+    def _capture_print(*args, **_kwargs):
+        printed.append(getattr(args[0], "plain", str(args[0])) if args else "")
+
+    monkeypatch.setattr(
+        shell_visualize.console,
+        "print",
+        _capture_print,
+    )
+
+    view.handle_immediate_steer(
+        UserInput(
+            mode=PromptMode.AGENT,
+            command="A steer follow-up",
+            resolved_command="A steer follow-up",
+            content=[TextPart(text="A steer follow-up")],
+        )
+    )
+
+    assert printed == ["✨ A steer follow-up", ""]
 
 
 @pytest.mark.asyncio
@@ -917,7 +959,7 @@ def _make_approval_delegate(request=None):
     delegate = ApprovalPromptDelegate(
         request,
         on_response=lambda req, resp, feedback="": responses.append((req.id, resp, feedback)),
-        buffer_text_provider=lambda: buf.text,
+        buffer_state_provider=lambda: (buf.text, buf.cursor_position),
     )
     return delegate, buf, responses
 
@@ -960,6 +1002,52 @@ def test_approval_feedback_renders_inline_input():
     plain = re.sub(r"\x1b\[[^m]*m", "", rendered.value)
     assert "use a safer command" in plain
     assert "Type your feedback" in plain
+
+
+def test_approval_feedback_cursor_markup_in_middle():
+    """When the cursor is in the middle, the helper wraps the character under
+    it with a reverse-video span — mimicking a terminal's native block cursor."""
+    from rich.text import Span
+
+    from kimi_cli.ui.shell.visualize._approval_panel import _render_feedback_with_cursor
+
+    # Cursor at position 2 ("he|llo world" — on the first 'l').
+    out = _render_feedback_with_cursor("hello world", 2)
+    assert out.plain == "hello world"
+    assert Span(2, 3, "reverse") in out.spans
+
+    # Cursor at start.
+    out = _render_feedback_with_cursor("hello world", 0)
+    assert out.plain == "hello world"
+    assert Span(0, 1, "reverse") in out.spans
+
+
+def test_approval_feedback_cursor_markup_at_end():
+    """When the cursor sits past the last character, a trailing block glyph
+    is emitted (the reverse-video trick requires a character to invert)."""
+    from kimi_cli.ui.shell.visualize._approval_panel import _render_feedback_with_cursor
+
+    assert _render_feedback_with_cursor("abc", 3).plain == "abc\u2588"
+    # Past-end cursor (defensive) also falls through to the trailing-block branch.
+    assert _render_feedback_with_cursor("abc", 10).plain == "abc\u2588"
+    # Empty text.
+    assert _render_feedback_with_cursor("", 0).plain == "\u2588"
+    # None means "unknown" — same fallback as end-of-text.
+    assert _render_feedback_with_cursor("abc", None).plain == "abc\u2588"
+
+
+def test_approval_feedback_cursor_markup_escapes_rich_metachars():
+    """Rich markup tags typed by the user (e.g. ``[bold]``) must render as
+    literal text, not be interpreted as styles — ``Text()`` takes plain strings."""
+    from rich.text import Span
+
+    from kimi_cli.ui.shell.visualize._approval_panel import _render_feedback_with_cursor
+
+    # The "[bold]" prefix stays verbatim; the reverse-cursor span is still
+    # applied around the character under the cursor ('h').
+    out = _render_feedback_with_cursor("[bold]hello", 6)
+    assert out.plain == "[bold]hello"
+    assert Span(6, 7, "reverse") in out.spans
 
 
 @pytest.mark.asyncio

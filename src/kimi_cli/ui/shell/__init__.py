@@ -24,14 +24,16 @@ from rich.text import Text
 
 from kimi_cli import logger
 from kimi_cli.background import list_task_views
+from kimi_cli.llm import model_display_name
 from kimi_cli.notifications import NotificationManager, NotificationWatcher
 from kimi_cli.soul import LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul
-from kimi_cli.soul.kimisoul import KimiSoul
+from kimi_cli.soul.kimisoul import FLOW_COMMAND_PREFIX, KimiSoul
 from kimi_cli.ui.shell import update as _update_mod
 from kimi_cli.ui.shell.console import console
 from kimi_cli.ui.shell.echo import render_user_echo_text
 from kimi_cli.ui.shell.mcp_status import render_mcp_prompt
 from kimi_cli.ui.shell.prompt import (
+    BgTaskCounts,
     CustomPromptSession,
     CwdLostError,
     PromptMode,
@@ -39,8 +41,8 @@ from kimi_cli.ui.shell.prompt import (
     toast,
 )
 from kimi_cli.ui.shell.replay import replay_recent_history
+from kimi_cli.ui.shell.slash import SKILL_COMMAND_PREFIX, shell_mode_registry
 from kimi_cli.ui.shell.slash import registry as shell_slash_registry
-from kimi_cli.ui.shell.slash import shell_mode_registry
 from kimi_cli.ui.shell.update import LATEST_VERSION_FILE, UpdateResult, do_update, semver_tuple
 from kimi_cli.ui.shell.visualize import (
     ApprovalPromptDelegate,
@@ -73,6 +75,9 @@ _MAX_BG_AUTO_TRIGGER_FAILURES = 3
 
 _BG_AUTO_TRIGGER_INPUT_GRACE_S = 0.75
 """Delay background auto-trigger briefly after local prompt activity."""
+
+_VISIBLE_WORKFLOW_SLASH_PREFIXES = (SKILL_COMMAND_PREFIX, FLOW_COMMAND_PREFIX)
+"""Explicit skill/flow prefixes that should remain visible in transcript."""
 
 
 class _BackgroundCompletionWatcher:
@@ -195,16 +200,38 @@ class Shell:
         self._current_prompt_approval_request: ApprovalRequest | None = None
         self._approval_modal: ApprovalPromptDelegate | None = None
         self._exit_after_run = False
+        soul_slash_commands = list(soul.available_slash_commands)
+        shell_slash_commands = shell_slash_registry.list_commands()
         self._available_slash_commands: dict[str, SlashCommand[Any]] = {
-            **{cmd.name: cmd for cmd in soul.available_slash_commands},
-            **{cmd.name: cmd for cmd in shell_slash_registry.list_commands()},
+            **{cmd.name: cmd for cmd in soul_slash_commands},
+            **{cmd.name: cmd for cmd in shell_slash_commands},
         }
-        """Shell-level slash commands + soul-level slash commands. Name to command mapping."""
+        """Shell-level slash commands + soul-level slash commands. Primary name mapping."""
+        self._available_slash_command_index = self._index_slash_commands(
+            [*soul_slash_commands, *shell_slash_commands]
+        )
+        """Shell-level slash commands + soul-level slash commands.
+        Primary name and alias mapping.
+        """
 
     @property
     def available_slash_commands(self) -> dict[str, SlashCommand[Any]]:
         """Get all available slash commands, including shell-level and soul-level commands."""
         return self._available_slash_commands
+
+    @staticmethod
+    def _index_slash_commands(commands: list[SlashCommand[Any]]) -> dict[str, SlashCommand[Any]]:
+        indexed: dict[str, SlashCommand[Any]] = {}
+        for command in commands:
+            indexed[command.name] = command
+            for alias in command.aliases:
+                indexed[alias] = command
+        return indexed
+
+    def _find_available_slash_command(self, name: str) -> SlashCommand[Any] | None:
+        return self._available_slash_command_index.get(name) or self._available_slash_commands.get(
+            name
+        )
 
     def _print_cwd_lost_crash(self) -> None:
         """Print a crash report when the working directory is no longer accessible."""
@@ -254,16 +281,29 @@ class Shell:
         return resolved_call
 
     @staticmethod
-    def _should_echo_agent_input(user_input: UserInput) -> bool:
+    def _should_echo_workflow_slash_input(user_input: UserInput) -> bool:
+        command_call = Shell._agent_slash_command_call(user_input)
+        return command_call is not None and command_call.name.startswith(
+            _VISIBLE_WORKFLOW_SLASH_PREFIXES
+        )
+
+    def _should_echo_agent_input(self, user_input: UserInput) -> bool:
         if user_input.mode != PromptMode.AGENT:
             return False
         if Shell._should_exit_input(user_input):
             return False
+        # Phase 1 policy: keep operational slash commands hidden, but show
+        # explicit `/skill:*` and `/flow:*` inputs because they represent
+        # user-visible workflow intent and otherwise vanish from transcript
+        # even when the command later fails to resolve.
+        if self._should_echo_workflow_slash_input(user_input):
+            return True
         return Shell._agent_slash_command_call(user_input) is None
 
     @staticmethod
     def _echo_agent_input(user_input: UserInput) -> None:
         console.print(render_user_echo_text(user_input.command))
+        console.print()
 
     def _bind_running_input(
         self,
@@ -339,6 +379,8 @@ class Shell:
             await idle_events.put(_PromptEvent(kind="input", user_input=user_input))
 
     async def run(self, command: str | None = None) -> bool:
+        _run_start_time = time.monotonic()
+
         # Initialize theme from config
         if isinstance(self.soul, KimiSoul):
             from kimi_cli.ui.theme import set_active_theme
@@ -362,6 +404,14 @@ class Shell:
             self._start_background_task(self._auto_update())
 
         _print_welcome_info(self.soul.name or "Kimi Code CLI", self._welcome_info)
+
+        # Start telemetry periodic flush and disk retry
+        from kimi_cli.telemetry import get_sink
+
+        _telemetry_sink = get_sink()
+        if _telemetry_sink is not None:
+            _telemetry_sink.start_periodic_flush()
+            self._start_background_task(_telemetry_sink.retry_disk_events())
 
         if isinstance(self.soul, KimiSoul):
             watcher = NotificationWatcher(
@@ -405,28 +455,35 @@ class Shell:
         @dataclass
         class _BgCountCache:
             time: float = 0.0
-            count: int = 0
+            counts: BgTaskCounts = BgTaskCounts()
 
         _bg_cache = _BgCountCache()
 
-        def _bg_task_count() -> int:
+        def _bg_task_counts() -> BgTaskCounts:
             if not isinstance(self.soul, KimiSoul):
-                return 0
+                return BgTaskCounts()
             now = time.monotonic()
             if now - _bg_cache.time < 1.0:
-                return _bg_cache.count
+                return _bg_cache.counts
             views = list_task_views(self.soul.runtime.background_tasks, active_only=True)
-            _bg_cache.count = sum(1 for v in views if v.spec.kind == "bash")
+            bash_n = sum(1 for v in views if v.spec.kind == "bash")
+            agent_n = sum(1 for v in views if v.spec.kind == "agent")
+            _bg_cache.counts = BgTaskCounts(bash=bash_n, agent=agent_n)
             _bg_cache.time = now
-            return _bg_cache.count
+            return _bg_cache.counts
 
         with CustomPromptSession(
             status_provider=lambda: self.soul.status,
             status_block_provider=_mcp_status_block,
             fast_refresh_provider=_mcp_status_loading,
-            background_task_count_provider=_bg_task_count,
+            background_task_count_provider=_bg_task_counts,
             model_capabilities=self.soul.model_capabilities or set(),
-            model_name=self.soul.model_name,
+            model_name=model_display_name(
+                self.soul.model_name,
+                self.soul.runtime.llm.model_config
+                if isinstance(self.soul, KimiSoul) and self.soul.runtime.llm
+                else None,
+            ),
             thinking=self.soul.thinking or False,
             agent_mode_slash_commands=list(self._available_slash_commands.values()),
             shell_mode_slash_commands=shell_mode_registry.list_commands(),
@@ -596,11 +653,16 @@ class Shell:
                         continue
 
                     if slash_cmd_call := self._agent_slash_command_call(user_input):
+                        available_command = self._find_available_slash_command(slash_cmd_call.name)
                         is_soul_slash = (
-                            slash_cmd_call.name in self._available_slash_commands
+                            available_command is not None
                             and shell_slash_registry.find_command(slash_cmd_call.name) is None
                         )
                         if is_soul_slash:
+                            from kimi_cli.telemetry import track
+
+                            assert available_command is not None
+                            track("input_command", command=available_command.name)
                             background_autotrigger_armed = True
                             resume_prompt.set()
                             await self.run_soul_command(slash_cmd_call.raw_input)
@@ -631,6 +693,21 @@ class Shell:
                     self._approval_modal = None
                 self._prompt_session = None
                 self._cancel_background_tasks()
+                # Track exit and flush remaining telemetry events.
+                # Cap the exit-path flush at 3 s so we don't block for ~50 s
+                # when the endpoint is unreachable (in-process retry backoff).
+                # On timeout the CancelledError handler in transport.send()
+                # persists in-flight events to disk; flush_sync() catches any
+                # events still in the buffer.
+                from kimi_cli.telemetry import track
+
+                track("exit", duration_s=time.monotonic() - _run_start_time)
+                if _telemetry_sink is not None:
+                    _telemetry_sink.stop_periodic_flush()
+                    try:
+                        await asyncio.wait_for(_telemetry_sink.flush(), timeout=3.0)
+                    except (TimeoutError, Exception):
+                        _telemetry_sink.flush_sync()
                 ensure_tty_sane()
 
         return shell_ok
@@ -667,6 +744,9 @@ class Shell:
             return
 
         logger.info("Running shell command: {cmd}", cmd=command)
+        from kimi_cli.telemetry import track
+
+        track("input_bash")
 
         proc: asyncio.subprocess.Process | None = None
 
@@ -694,14 +774,19 @@ class Shell:
 
     async def _run_slash_command(self, command_call: SlashCommandCall) -> None:
         from kimi_cli.cli import Reload, SwitchToVis, SwitchToWeb
+        from kimi_cli.telemetry import track
 
-        if command_call.name not in self._available_slash_commands:
+        available_command = self._find_available_slash_command(command_call.name)
+        if available_command is None:
             logger.info("Unknown slash command /{command}", command=command_call.name)
+            track("input_command_invalid")
             console.print(
                 f'[red]Unknown slash command "/{command_call.name}", '
                 'type "/" for all available commands[/red]'
             )
             return
+
+        track("input_command", command=available_command.name)
 
         command = shell_slash_registry.find_command(command_call.name)
         if command is None:
@@ -823,6 +908,7 @@ class Shell:
                     break
                 queued = pending.pop(0)
                 console.print(render_user_echo_text(queued.command))
+                console.print()
                 await run_soul(
                     self.soul,
                     queued.content,
@@ -1290,6 +1376,12 @@ class Shell:
                     continue
                 self._forward_approval_to_sink(request)
 
+    def _get_default_buffer_text_and_cursor(self) -> tuple[str, int]:
+        if self._prompt_session is None:
+            return "", 0
+        buf = self._prompt_session._session.default_buffer  # pyright: ignore[reportPrivateUsage]
+        return buf.text, buf.cursor_position
+
     def _activate_prompt_approval_modal(self) -> None:
         if self._prompt_session is None:
             return
@@ -1306,11 +1398,7 @@ class Shell:
             self._approval_modal = ApprovalPromptDelegate(
                 current_request,
                 on_response=self._handle_prompt_approval_response,
-                buffer_text_provider=(
-                    lambda: self._prompt_session._session.default_buffer.text  # pyright: ignore[reportPrivateUsage]
-                    if self._prompt_session is not None
-                    else ""
-                ),
+                buffer_state_provider=self._get_default_buffer_text_and_cursor,
                 text_expander=self._prompt_session._get_placeholder_manager().serialize_for_history,  # pyright: ignore[reportPrivateUsage]
             )
             self._prompt_session.attach_modal(self._approval_modal)
@@ -1438,6 +1526,9 @@ def _print_welcome_info(name: str, info_items: list[WelcomeInfoItem]) -> None:
                             f"Please run `{_update_mod.UPGRADE_COMMAND}` to upgrade.[/yellow]"
                         )
                     )
+                    from kimi_cli.telemetry import track
+
+                    track("update_prompted", current=current_version, latest=latest_version)
 
     console.print(
         Panel(
